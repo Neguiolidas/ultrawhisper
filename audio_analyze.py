@@ -175,16 +175,67 @@ def extract_json(data: dict) -> dict | None:
 
 # ---------------- Gemini provider ----------------
 
-def gemini_analyze(base: str, key: str, model: str, media_part: dict,
-                   diarize: bool = False) -> dict | None:
+def gemini_analyze(base: str, key: str, model: str, media_part: dict) -> dict | None:
     url = f"{base}/{model}:generateContent?key={key}"
-    prompt = ANALYZE_PROMPT + (DIARIZE_INSTRUCTION if diarize else "")
+    payload = {
+        "contents": [{"parts": [{"text": ANALYZE_PROMPT}, media_part]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+    data = http_post_json(url, {"Content-Type": "application/json"}, payload)
+    return extract_json(data) if data else None
+
+
+def gemini_diarize(base: str, key: str, model: str, media_part: dict,
+                  lang: str = "pt") -> list | None:
+    """Diarization in a separate call (same prompt as transcribe --diarize).
+
+    Separated because diarization competes for attention with tone/emotion/
+    intent analysis in a single prompt, causing unstable speaker counts.
+    Returns a list of {"speaker", "start", "end", "text"} or None.
+    """
+    url = f"{base}/{model}:generateContent?key={key}"
+    prompt = (
+        f"Transcreva este áudio de forma fiel em {lang}, identificando os "
+        "diferentes falantes pela voz.\n"
+        "Para cada trecho de fala, use exatamente este formato:\n"
+        "[FALANTE 1] [00:00-00:05] texto do que foi dito\n"
+        "[FALANTE 2] [00:06-00:12] texto do que foi dito\n"
+        "Regras:\n"
+        "- Atribua o mesmo número ao mesmo falante durante todo o áudio\n"
+        "- Os timestamps são início e fim aproximados de cada trecho (MM:SS)\n"
+        "- Se houver apenas um falante, use [FALANTE 1] em todos os trechos\n"
+        "- Não invente falantes: só crie um novo número quando a voz mudar claramente\n"
+        "- Atenção: falantes do mesmo gênero (ex.: dois homens) têm vozes diferentes "
+        "— preste atenção no timbre, ritmo e tom, não só no gênero\n"
+        "- Retorne apenas a transcrição com as marcações, sem comentários."
+    )
     payload = {
         "contents": [{"parts": [{"text": prompt}, media_part]}],
         "generationConfig": {"temperature": 0.2},
     }
     data = http_post_json(url, {"Content-Type": "application/json"}, payload)
-    return extract_json(data) if data else None
+    if not data:
+        return None
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    # Parse [FALANTE N] [MM:SS-MM:SS] text lines
+    import re
+    segments = []
+    for line in text.strip().split("\n"):
+        m = re.match(
+            r"\[FALANTE (\d+)\]\s*\[(\d+:\d+)-(\d+:\d+)\]\s*(.*)",
+            line.strip(),
+        )
+        if m:
+            segments.append({
+                "speaker": f"FALANTE {m.group(1)}",
+                "start": m.group(2),
+                "end": m.group(3),
+                "text": m.group(4).strip(),
+            })
+    return segments or None
 
 
 # ---------------- OpenAI-compatible provider ----------------
@@ -307,9 +358,17 @@ def main() -> int:
                 if tmp_path and tmp_path != args.source:
                     os.unlink(tmp_path)
         for m in models:
-            result = gemini_analyze(base, key, m, media_part,
-                                    diarize=args.diarize)
+            result = gemini_analyze(base, key, m, media_part)
             if result:
+                if args.diarize:
+                    print("diarizing in separate call...",
+                          file=sys.stderr)
+                    dz = gemini_diarize(base, key, m, media_part)
+                    if dz:
+                        result["diarization"] = dz
+                    else:
+                        print("warn: diarization returned nothing",
+                              file=sys.stderr)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return 0
             print(f"warn: no usable result from {m}, trying next...",
