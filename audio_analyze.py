@@ -185,13 +185,69 @@ def gemini_analyze(base: str, key: str, model: str, media_part: dict) -> dict | 
     return extract_json(data) if data else None
 
 
-def gemini_diarize(base: str, key: str, model: str, media_part: dict,
-                  lang: str = "pt") -> list | None:
-    """Diarization in a separate call (same prompt as transcribe --diarize).
+def _parse_diarize_segments(text: str) -> list[dict]:
+    """Parse [FALANTE N] [MM:SS-MM:SS] text into segments."""
+    import re
+    segments = []
+    for line in text.strip().split("\n"):
+        m = re.match(
+            r"\[FALANTE (\d+)\]\s*\[(\d+:\d+)-(\d+:\d+)\]\s*(.*)",
+            line.strip(),
+        )
+        if m:
+            segments.append({
+                "speaker": f"FALANTE {m.group(1)}",
+                "start": m.group(2),
+                "end": m.group(3),
+                "text": m.group(4).strip(),
+            })
+    return segments
 
-    Separated because diarization competes for attention with tone/emotion/
-    intent analysis in a single prompt, causing unstable speaker counts.
-    Returns a list of {"speaker", "start", "end", "text"} or None.
+
+def _diarize_agreement(segs_a: list[dict], segs_b: list[dict]) -> float:
+    """Agreement score between two diarization runs (0-1)."""
+    if not segs_a or not segs_b:
+        return 0.0
+    from collections import Counter
+    mapping = Counter()
+    for sa in segs_a:
+        words_a = set(sa["text"].lower().split())
+        if not words_a:
+            continue
+        best_b, best_overlap = None, 0
+        for sb in segs_b:
+            words_b = set(sb["text"].lower().split())
+            overlap = len(words_a & words_b) / max(len(words_a), 1)
+            if overlap > best_overlap:
+                best_overlap, best_b = overlap, sb
+        if best_b and best_overlap > 0.5:
+            mapping[(sa["speaker"], best_b["speaker"])] += 1
+    label_map, used_b = {}, set()
+    for (la, lb), _ in mapping.most_common():
+        if la not in label_map and lb not in used_b:
+            label_map[la] = lb
+            used_b.add(lb)
+    agree, total = 0, 0
+    for sa in segs_a:
+        words_a = set(sa["text"].lower().split())
+        if not words_a:
+            continue
+        total += 1
+        for sb in segs_b:
+            words_b = set(sb["text"].lower().split())
+            if len(words_a & words_b) / max(len(words_a), 1) > 0.5:
+                if label_map.get(sa["speaker"]) == sb["speaker"]:
+                    agree += 1
+                break
+    return agree / max(total, 1)
+
+
+def gemini_diarize(base: str, key: str, model: str, media_part: dict,
+                  lang: str = "pt", rounds: int = 3) -> list | None:
+    """Diarization in separate call with consensus voting.
+
+    Runs N times, picks the run with highest consensus agreement.
+    Returns [{"speaker", "start", "end", "text"}] or None.
     """
     url = f"{base}/{model}:generateContent?key={key}"
     prompt = (
@@ -209,33 +265,47 @@ def gemini_diarize(base: str, key: str, model: str, media_part: dict,
         "— preste atenção no timbre, ritmo e tom, não só no gênero\n"
         "- Retorne apenas a transcrição com as marcações, sem comentários."
     )
-    payload = {
-        "contents": [{"parts": [{"text": prompt}, media_part]}],
-        "generationConfig": {"temperature": 0.2},
-    }
-    data = http_post_json(url, {"Content-Type": "application/json"}, payload)
-    if not data:
+    runs: list[list[dict]] = []
+    for i in range(rounds):
+        payload = {
+            "contents": [{"parts": [{"text": prompt}, media_part]}],
+            "generationConfig": {"temperature": 0.2},
+        }
+        data = http_post_json(url, {"Content-Type": "application/json"}, payload)
+        if not data:
+            continue
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError):
+            continue
+        segments = _parse_diarize_segments(text)
+        n_speakers = len(set(s["speaker"] for s in segments))
+        print(f"diarize run {i + 1}/{rounds}: {n_speakers} speakers, "
+              f"{len(segments)} segments", file=sys.stderr)
+        if segments:
+            runs.append(segments)
+
+    if not runs:
         return None
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError):
-        return None
-    # Parse [FALANTE N] [MM:SS-MM:SS] text lines
-    import re
-    segments = []
-    for line in text.strip().split("\n"):
-        m = re.match(
-            r"\[FALANTE (\d+)\]\s*\[(\d+:\d+)-(\d+:\d+)\]\s*(.*)",
-            line.strip(),
-        )
-        if m:
-            segments.append({
-                "speaker": f"FALANTE {m.group(1)}",
-                "start": m.group(2),
-                "end": m.group(3),
-                "text": m.group(4).strip(),
-            })
-    return segments or None
+    if len(runs) == 1:
+        return runs[0]
+
+    best_idx, best_score = 0, -1.0
+    for i in range(len(runs)):
+        total = sum(_diarize_agreement(runs[i], runs[j])
+                    for j in range(len(runs)) if i != j)
+        avg = total / (len(runs) - 1)
+        n_spk = len(set(s["speaker"] for s in runs[i]))
+        print(f"run {i + 1} consensus score: {avg:.2f}", file=sys.stderr)
+        if (avg, n_spk) > (best_score, 0):
+            best_score, best_idx = avg, i
+
+    print(f"selected run {best_idx + 1} (consensus {best_score:.2f})",
+          file=sys.stderr)
+    if best_score < 0.7:
+        print("warn: low consensus between runs, result may be unstable",
+              file=sys.stderr)
+    return runs[best_idx]
 
 
 # ---------------- OpenAI-compatible provider ----------------
