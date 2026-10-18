@@ -1,4 +1,4 @@
-# UltraWhisper
+# Whispero
 
 Audio transcription and deep audio analysis with any OpenAI-compatible
 provider. Defaults to Gemini's native audio input (transcribes *and*
@@ -9,6 +9,12 @@ Unlike pure ASR models, the Gemini path processes audio with reasoning: it
 transcribes, cleans up, structures output, detects speakers, emotions, and
 action items in a single pass.
 
+## Install
+
+```bash
+pip install whispero
+```
+
 ## Setup
 
 ```bash
@@ -16,7 +22,7 @@ action items in a single pass.
 export GEMINI_API_KEY="your-key-here"
 
 # ...or any provider key, picked up automatically
-export ULTRAWHISPER_API_KEY="your-key-here"
+export WHISPERO_API_KEY="your-key-here"
 export OPENAI_API_KEY="your-key-here"
 ```
 
@@ -24,32 +30,32 @@ export OPENAI_API_KEY="your-key-here"
 
 ```bash
 # Simple transcription, Gemini (Portuguese default)
-python3 scripts/transcribe.py meeting.mp3
+whispero meeting.mp3
 
 # English transcription
-python3 scripts/transcribe.py call.mp3 --lang en
+whispero call.mp3 --lang en
 
 # YouTube URL directly, no download needed (Gemini only)
-python3 scripts/transcribe.py "https://www.youtube.com/watch?v=..." --lang en
-python3 scripts/audio_analyze.py "https://www.youtube.com/watch?v=..."
+whispero "https://www.youtube.com/watch?v=..." --lang en
+whispero-analyze "https://www.youtube.com/watch?v=..."
 
 # OpenAI-compatible provider (Whisper-style API)
-python3 scripts/transcribe.py meeting.mp3 --provider openai
-python3 scripts/transcribe.py meeting.mp3 --provider openai \
+whispero meeting.mp3 --provider openai
+whispero meeting.mp3 --provider openai \
     --base-url https://api.groq.com/openai/v1 \
     --model whisper-large-v3
 
 # Deep analysis: transcript, speakers, tone, emotions, urgency,
 # intent, action items, key moments, irony/sarcasm detection
-python3 scripts/audio_analyze.py meeting.mp3
-python3 scripts/audio_analyze.py meeting.mp3 --provider openai \
+whispero-analyze meeting.mp3
+whispero-analyze meeting.mp3 --provider openai \
     --base-url https://api.groq.com/openai/v1
 
 # Faster upload for large files (compresses to opus 32k first, local files only)
-python3 scripts/transcribe.py long.mp3 --compress
+whispero long.mp3 --compress
 
 # Configurable fallback models (comma-separated, tried in order)
-python3 scripts/transcribe.py meeting.mp3 --fallback-models gemini-2.0-flash
+whispero meeting.mp3 --fallback-models gemini-2.0-flash
 ```
 
 ## Features
