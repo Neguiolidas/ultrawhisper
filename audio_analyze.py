@@ -79,14 +79,19 @@ ANALYZE_TEXT_PROMPT = (
 )
 
 DIARIZE_INSTRUCTION = (
-    "\nDIARIZAÇÃO ATIVA: identifique cada falante pela voz e marque cada "
-    "trecho com [FALANTE 1], [FALANTE 2], etc. Inclua no JSON um campo "
-    "adicional:\n"
-    '- diarization: lista de {"speaker": "FALANTE N", "start": "MM:SS", '
-    '"end": "MM:SS", "text": "trecho transcrito"} em ordem temporal, '
-    "cobrindo todo o áudio\n"
-    "Atribua o mesmo número ao mesmo falante do início ao fim. Não invente "
-    "falantes: só crie um novo número quando a voz mudar claramente."
+    "\nDIARIZAÇÃO ATIVA: identifique os diferentes falantes pela voz. "
+    "Para cada trecho de fala, use exatamente este formato no campo diarization:\n"
+    '{"speaker": "FALANTE 1", "start": "00:00", "end": "00:15", "text": "texto do que foi dito"}\n'
+    "Regras:\n"
+    "- Atribua o mesmo número ao mesmo falante durante todo o áudio\n"
+    "- O timestamp é o momento aproximado em que o trecho começa/termina (MM:SS)\n"
+    "- Se houver apenas um falante, use FALANTE 1 em todos os trechos\n"
+    "- Não invente falantes: só crie um novo número quando a voz mudar claramente\n"
+    "- Atenção: falantes do mesmo gênero (ex.: dois homens) têm vozes diferentes "
+    "— preste atenção no timbre, ritmo e tom, não só no gênero\n"
+    '- Inclua no JSON o campo "diarization": lista de {"speaker": "FALANTE N", '
+    '"start": "MM:SS", "end": "MM:SS", "text": "trecho transcrito"} '
+    "em ordem temporal, cobrindo todo o áudio"
 )
 
 
