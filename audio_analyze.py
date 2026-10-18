@@ -78,6 +78,17 @@ ANALYZE_TEXT_PROMPT = (
     "Retorne APENAS o JSON, sem markdown nem comentários.\n\nTranscrição:\n"
 )
 
+DIARIZE_INSTRUCTION = (
+    "\nDIARIZAÇÃO ATIVA: identifique cada falante pela voz e marque cada "
+    "trecho com [FALANTE 1], [FALANTE 2], etc. Inclua no JSON um campo "
+    "adicional:\n"
+    '- diarization: lista de {"speaker": "FALANTE N", "start": "MM:SS", '
+    '"end": "MM:SS", "text": "trecho transcrito"} em ordem temporal, '
+    "cobrindo todo o áudio\n"
+    "Atribua o mesmo número ao mesmo falante do início ao fim. Não invente "
+    "falantes: só crie um novo número quando a voz mudar claramente."
+)
+
 
 def is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
@@ -159,11 +170,12 @@ def extract_json(data: dict) -> dict | None:
 
 # ---------------- Gemini provider ----------------
 
-def gemini_analyze(base: str, key: str, model: str,
-                   media_part: dict) -> dict | None:
+def gemini_analyze(base: str, key: str, model: str, media_part: dict,
+                   diarize: bool = False) -> dict | None:
     url = f"{base}/{model}:generateContent?key={key}"
+    prompt = ANALYZE_PROMPT + (DIARIZE_INSTRUCTION if diarize else "")
     payload = {
-        "contents": [{"parts": [{"text": ANALYZE_PROMPT}, media_part]}],
+        "contents": [{"parts": [{"text": prompt}, media_part]}],
         "generationConfig": {"temperature": 0.2},
     }
     data = http_post_json(url, {"Content-Type": "application/json"}, payload)
@@ -255,6 +267,10 @@ def main() -> int:
                    help="Comma-separated fallback models to try in order")
     p.add_argument("--compress", action="store_true",
                    help="Compress to opus 32k before upload (local files only)")
+    p.add_argument("--diarize", action="store_true",
+                   help="Identify speakers ([FALANTE 1], [FALANTE 2], ...) "
+                        "with timestamps; adds a diarization section to "
+                        "the JSON output")
     args = p.parse_args()
 
     key = get_api_key(args)
@@ -286,7 +302,8 @@ def main() -> int:
                 if tmp_path and tmp_path != args.source:
                     os.unlink(tmp_path)
         for m in models:
-            result = gemini_analyze(base, key, m, media_part)
+            result = gemini_analyze(base, key, m, media_part,
+                                    diarize=args.diarize)
             if result:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return 0
