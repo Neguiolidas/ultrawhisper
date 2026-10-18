@@ -222,6 +222,177 @@ def gemini_transcribe(base: str, key: str, model: str, prompt: str,
         return None
 
 
+def parse_diarize_lines(text: str) -> list[dict]:
+    """Parse [FALANTE N] [MM:SS] text lines into segments."""
+    import re
+    segments = []
+    for line in text.strip().split("\n"):
+        m = re.match(
+            r"\[FALANTE (\d+)\]\s*\[(\d+:\d+)\]\s*(.*)",
+            line.strip(),
+        )
+        if m:
+            segments.append({
+                "speaker": f"FALANTE {m.group(1)}",
+                "start": m.group(2),
+                "text": m.group(3).strip(),
+            })
+    return segments
+
+
+def _speaker_agreement(segs_a: list[dict], segs_b: list[dict]) -> float:
+    """Agreement score between two diarization runs (0-1).
+
+    Accounts for label permutation (FALANTE 1 in run A might be
+    FALANTE 2 in run B). Uses text matching to align segments.
+    """
+    if not segs_a or not segs_b:
+        return 0.0
+    # Build mapping from run A labels to run B labels via text overlap
+    # Simple: for each segment in A, find best text match in B
+    from collections import Counter
+    mapping = Counter()  # (label_a, label_b) -> count
+    for sa in segs_a:
+        best_b = None
+        best_overlap = 0
+        words_a = set(sa["text"].lower().split())
+        if not words_a:
+            continue
+        for sb in segs_b:
+            words_b = set(sb["text"].lower().split())
+            overlap = len(words_a & words_b) / max(len(words_a), 1)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_b = sb
+        if best_b and best_overlap > 0.5:
+            mapping[(sa["speaker"], best_b["speaker"])] += 1
+    # Find best label mapping (greedy)
+    label_map = {}
+    used_b = set()
+    for (la, lb), cnt in mapping.most_common():
+        if la not in label_map and lb not in used_b:
+            label_map[la] = lb
+            used_b.add(lb)
+    # Score: fraction of A segments whose mapped label matches B
+    agree = 0
+    total = 0
+    for sa in segs_a:
+        words_a = set(sa["text"].lower().split())
+        if not words_a:
+            continue
+        total += 1
+        for sb in segs_b:
+            words_b = set(sb["text"].lower().split())
+            overlap = len(words_a & words_b) / max(len(words_a), 1)
+            if overlap > 0.5:
+                if label_map.get(sa["speaker"]) == sb["speaker"]:
+                    agree += 1
+                break
+    return agree / max(total, 1)
+
+
+def _build_label_map(ref_segs: list[dict], run_segs: list[dict]) -> dict[str, str]:
+    """Map run's speaker labels to reference run's labels via text overlap."""
+    from collections import Counter
+    mapping = Counter()  # (ref_label, run_label) -> count
+    for rs in ref_segs:
+        words_ref = set(rs["text"].lower().split())
+        if not words_ref:
+            continue
+        for s in run_segs:
+            words_s = set(s["text"].lower().split())
+            if not words_s:
+                continue
+            overlap = len(words_ref & words_s) / max(len(words_ref), 1)
+            if overlap > 0.5:
+                mapping[(rs["speaker"], s["speaker"])] += 1
+                break
+    label_map: dict[str, str] = {}
+    used_ref = set()
+    for (ref_label, run_label), _ in mapping.most_common():
+        if run_label not in label_map and ref_label not in used_ref:
+            label_map[run_label] = ref_label
+            used_ref.add(ref_label)
+    return label_map
+
+
+def gemini_diarize_vote(base: str, key: str, model: str, media_part: dict,
+                       lang: str = "pt", rounds: int = 3) -> str | None:
+    """Diarization with segment-level majority vote across N runs.
+
+    Runs the diarization prompt N times, aligns speaker labels across runs
+    via text matching, then takes majority vote per segment. More robust
+    than picking a whole run: a single bad run can't corrupt the output.
+    Returns the diarized text with consensus labels.
+    """
+    from collections import Counter
+    prompt = DIARIZE_PROMPT_TEMPLATE.format(lang=lang)
+    all_runs: list[list[dict]] = []
+    for i in range(rounds):
+        text = gemini_transcribe(base, key, model, prompt, media_part)
+        if not text:
+            continue
+        segments = parse_diarize_lines(text)
+        n_speakers = len(set(s["speaker"] for s in segments))
+        print(f"diarize run {i + 1}/{rounds}: {n_speakers} speakers, "
+              f"{len(segments)} segments", file=sys.stderr)
+        if segments:
+            all_runs.append(segments)
+
+    if not all_runs:
+        return None
+    if len(all_runs) == 1:
+        return _segments_to_text(all_runs[0])
+
+    ref = all_runs[0]
+    # Build label maps from each run to reference
+    label_maps = [_build_label_map(ref, run) for run in all_runs]
+
+    result = []
+    for rs in ref:
+        votes: Counter[str] = Counter()
+        votes[rs["speaker"]] += 1  # reference votes for itself
+        words_ref = set(rs["text"].lower().split())
+        for run_idx, run in enumerate(all_runs[1:], 1):
+            lmap = label_maps[run_idx]
+            for s in run:
+                words_s = set(s["text"].lower().split())
+                if not words_s:
+                    continue
+                overlap = len(words_ref & words_s) / max(len(words_ref), 1)
+                if overlap > 0.5:
+                    # Map to reference label space
+                    canonical = lmap.get(s["speaker"], s["speaker"])
+                    votes[canonical] += 1
+                    break
+        winner = votes.most_common(1)[0][0]
+        result.append({
+            "speaker": winner,
+            "start": rs["start"],
+            "text": rs["text"],
+        })
+
+    # Renumber by first appearance
+    seen: dict[str, str] = {}
+    counter = 0
+    for s in result:
+        if s["speaker"] not in seen:
+            counter += 1
+            seen[s["speaker"]] = f"FALANTE {counter}"
+        s["speaker"] = seen[s["speaker"]]
+
+    n_final = len(set(s["speaker"] for s in result))
+    print(f"consensus: {n_final} speakers from {rounds} runs",
+          file=sys.stderr)
+    return _segments_to_text(result)
+
+
+def _segments_to_text(segments: list[dict]) -> str:
+    return "\n".join(
+        f"[{s['speaker']}] [{s['start']}] {s['text']}" for s in segments
+    )
+
+
 # ---------------- OpenAI-compatible provider ----------------
 
 def openai_transcribe(base: str, key: str, model: str, audio_path: str,
@@ -392,15 +563,11 @@ def main() -> int:
             return 5
 
         prompt = args.prompt or (
-            DIARIZE_PROMPT_TEMPLATE.format(lang=args.lang)
-            if args.diarize
-            else (
-                f"Transcreva este áudio de forma fiel em {args.lang}. "
-                "Retorne apenas a transcrição, sem comentários."
-                if args.lang.startswith("pt")
-                else f"Transcribe this audio faithfully in {args.lang}. "
-                     "Return only the transcript, no commentary."
-            )
+            f"Transcreva este áudio de forma fiel em {args.lang}. "
+            "Retorne apenas a transcrição, sem comentários."
+            if args.lang.startswith("pt")
+            else f"Transcribe this audio faithfully in {args.lang}. "
+                 "Return only the transcript, no commentary."
         )
         tmp_path = None
         if is_url(args.source):
@@ -424,7 +591,12 @@ def main() -> int:
                 if tmp_path and tmp_path != args.source:
                     os.unlink(tmp_path)
         for m in models:
-            text = gemini_transcribe(base, key, m, prompt, media_part)
+            if args.diarize and not args.prompt:
+                # Diarization in separate call with voting (stable speaker count)
+                text = gemini_diarize_vote(base, key, m, media_part,
+                                           lang=args.lang)
+            else:
+                text = gemini_transcribe(base, key, m, prompt, media_part)
             if text:
                 print(text)
                 return 0
