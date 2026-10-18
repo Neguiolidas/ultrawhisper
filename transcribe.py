@@ -35,6 +35,7 @@ DEFAULT_OPENAI_MODEL = "whisper-1"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 OPENAI_API_BASE = "https://api.openai.com/v1"
 MAX_RETRIES = 3
+ROUND_DELAY = 2  # seconds between diarization rounds
 RETRY_DELAYS = [2, 5, 10]
 
 DIARIZE_PROMPT_TEMPLATE = (
@@ -317,7 +318,19 @@ def _build_label_map(ref_segs: list[dict], run_segs: list[dict]) -> dict[str, st
 
 
 def gemini_diarize_vote(base: str, key: str, model: str, media_part: dict,
-                       lang: str = "pt", rounds: int = 3) -> str | None:
+                       lang: str = "pt", rounds: int = 3,
+                       audio_path: str | None = None) -> str | None:
+    """Text wrapper around gemini_diarize_vote_segments (kept for the CLI)."""
+    segs = gemini_diarize_vote_segments(base, key, model, media_part,
+                                        lang=lang, rounds=rounds)
+    if segs and audio_path:
+        segs = pitch_split(segs, audio_path)
+    return _segments_to_text(segs) if segs else None
+
+
+def gemini_diarize_vote_segments(base: str, key: str, model: str,
+                                 media_part: dict, lang: str = "pt",
+                                 rounds: int = 3) -> list[dict] | None:
     """Diarization with segment-level majority vote across N runs.
 
     Runs the diarization prompt N times, aligns speaker labels across runs
@@ -329,6 +342,8 @@ def gemini_diarize_vote(base: str, key: str, model: str, media_part: dict,
     prompt = DIARIZE_PROMPT_TEMPLATE.format(lang=lang)
     all_runs: list[list[dict]] = []
     for i in range(rounds):
+        if i:
+            time.sleep(ROUND_DELAY)  # spread calls: avoids 429 bursts
         text = gemini_transcribe(base, key, model, prompt, media_part)
         if not text:
             continue
@@ -342,7 +357,7 @@ def gemini_diarize_vote(base: str, key: str, model: str, media_part: dict,
     if not all_runs:
         return None
     if len(all_runs) == 1:
-        return _segments_to_text(all_runs[0])
+        return all_runs[0]
 
     ref = all_runs[0]
     # Build label maps from each run to reference
@@ -382,9 +397,131 @@ def gemini_diarize_vote(base: str, key: str, model: str, media_part: dict,
         s["speaker"] = seen[s["speaker"]]
 
     n_final = len(set(s["speaker"] for s in result))
-    print(f"consensus: {n_final} speakers from {rounds} runs",
+    print(f"consensus: {n_final} speakers from {len(all_runs)} runs",
           file=sys.stderr)
-    return _segments_to_text(result)
+    return result
+
+
+# ---------------- Pitch check (same-gender split) ----------------
+
+def _decode_mono(audio_path: str, sr: int = 16000):
+    """Decode to mono float32 via ffmpeg. Returns numpy array or None."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", audio_path, "-ac", "1",
+             "-ar", str(sr), "-f", "f32le", "-"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=300,
+        ).stdout
+    except Exception:
+        return None
+    return np.frombuffer(raw, np.float32) if raw else None
+
+
+def _median_f0(x, sr: int = 16000):
+    """Median pitch (Hz) of voiced 40 ms frames, autocorrelation method."""
+    import numpy as np
+    fr = int(0.04 * sr)
+    lo, hi = int(sr / 400), int(sr / 60)
+    vals = []
+    for s in range(0, len(x) - fr, fr):
+        f = x[s:s + fr]
+        if np.sqrt((f ** 2).mean()) < 0.02:
+            continue
+        f = f - f.mean()
+        c = np.correlate(f, f, "full")[fr - 1:]
+        k = lo + int(np.argmax(c[lo:hi]))
+        if c[k] > 0.3 * c[0]:
+            vals.append(sr / k)
+    return float(np.median(vals)) if len(vals) >= 3 else None
+
+
+def _ts_to_s(ts: str) -> float:
+    parts = ts.split(":")
+    return int(parts[-2]) * 60 + float(parts[-1])
+
+
+def pitch_split(segments: list[dict], audio_path: str,
+                min_semitones: float = 5.0,
+                min_gap: float = 1.4,
+                max_semitones: float = 10.0) -> list[dict]:
+    """Split a speaker label whose segments fall into two pitch groups.
+
+    LLM diarization tends to merge two same-gender voices into one label
+    (systematic, so consensus voting can't fix it). For each label, take
+    the median F0 of each segment, run 2-means on log-pitch and split the
+    label when the two groups sit >= min_semitones apart with an empty band
+    of >= min_gap semitones between them (one expressive voice spreads
+    continuously; two voices leave a hole).
+    Groups more than max_semitones apart (a man and a woman under one label)
+    are left alone: that mix-up comes from text alignment, not from voice.
+    Needs numpy + a local file; otherwise returns segments unchanged.
+    """
+    au = _decode_mono(audio_path)
+    if au is None or not segments:
+        return segments
+    import numpy as np
+    sr = 16000
+    total = len(au) / sr
+    f0s = []
+    for i, s in enumerate(segments):
+        st = _ts_to_s(s["start"])
+        en = _ts_to_s(segments[i + 1]["start"]) if i + 1 < len(segments) else total
+        en = max(en, st + 1.0)
+        f0s.append(_median_f0(au[int(st * sr):int(en * sr)], sr))
+    labels = sorted(set(s["speaker"] for s in segments))
+    next_n = len(labels) + 1
+    out = [dict(s) for s in segments]
+    for lab in labels:
+        idx = [i for i, s in enumerate(segments)
+               if s["speaker"] == lab and f0s[i]]
+        if len(idx) < 4:
+            continue
+        v = np.log2(np.array([f0s[i] for i in idx])) * 12  # semitones
+        vs = np.sort(v)
+        n = len(vs)
+        # optimal 2-group split of the sorted pitches (max between-group var)
+        k = max(range(2, n - 1), key=lambda k: k * (n - k) *
+                (vs[:k].mean() - vs[k:].mean()) ** 2)
+        lo_g, hi_g = vs[:k], vs[k:]
+        sep = hi_g.mean() - lo_g.mean()
+        gap = hi_g.min() - lo_g.max()
+        if sep < min_semitones or sep > max_semitones or gap < min_gap:
+            continue
+        thr = (lo_g.max() + hi_g.min()) / 2
+        # the split-off group may be an existing speaker the model mislabeled:
+        # reuse that label when its median pitch is within 3 semitones
+        hi_med = float(np.median(hi_g))
+        target, best_d = None, 3.0
+        for other in labels:
+            if other == lab:
+                continue
+            ov = [np.log2(f0s[i]) * 12 for i, s in enumerate(segments)
+                  if s["speaker"] == other and f0s[i]]
+            if ov:
+                d = abs(float(np.median(ov)) - hi_med)
+                if d < best_d:
+                    target, best_d = other, d
+        new_lab = target or f"FALANTE {next_n}"
+        if not target:
+            next_n += 1
+        for j, i in enumerate(idx):
+            if v[j] > thr:
+                out[i]["speaker"] = new_lab
+        print(f"pitch check: split {lab} -> {lab} + {new_lab} "
+              f"({sep:.1f} semitones apart"
+              f"{', merged into existing label' if target else ''})",
+              file=sys.stderr)
+    # renumber by first appearance
+    seen: dict[str, str] = {}
+    for s in out:
+        if s["speaker"] not in seen:
+            seen[s["speaker"]] = f"FALANTE {len(seen) + 1}"
+        s["speaker"] = seen[s["speaker"]]
+    return out
 
 
 def _segments_to_text(segments: list[dict]) -> str:
@@ -492,6 +629,9 @@ def main() -> int:
     p.add_argument("--diarize", action="store_true",
                    help="Identify speakers ([FALANTE 1], [FALANTE 2], ...) "
                         "with approximate timestamps")
+    p.add_argument("--no-pitch-check", action="store_true",
+                   help="Disable the pitch check that splits two same-gender "
+                        "voices merged into one label (needs numpy)")
     p.add_argument("--diarize-engine", default="llm",
                    choices=["llm", "pyannote"],
                    help="Diarization engine: llm (prompt-based, works out of "
@@ -593,8 +733,11 @@ def main() -> int:
         for m in models:
             if args.diarize and not args.prompt:
                 # Diarization in separate call with voting (stable speaker count)
-                text = gemini_diarize_vote(base, key, m, media_part,
-                                           lang=args.lang)
+                text = gemini_diarize_vote(
+                    base, key, m, media_part, lang=args.lang,
+                    audio_path=None if (is_url(args.source)
+                                        or args.no_pitch_check)
+                    else args.source)
             else:
                 text = gemini_transcribe(base, key, m, prompt, media_part)
             if text:
