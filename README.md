@@ -54,9 +54,46 @@ whispero-analyze meeting.mp3 --provider openai \
 # Faster upload for large files (compresses to opus 32k first, local files only)
 whispero long.mp3 --compress
 
+# Speaker diarization: who said what, with timestamps
+whispero meeting.mp3 --diarize
+whispero-analyze meeting.mp3 --diarize
+
+# Precise diarization engine (needs pyannote.audio + HF_TOKEN)
+pip install "whispero[diarize]"
+whispero meeting.mp3 --diarize --diarize-engine pyannote
+
 # Configurable fallback models (comma-separated, tried in order)
 whispero meeting.mp3 --fallback-models gemini-2.0-flash
 ```
+
+## Speaker diarization
+
+`--diarize` identifies who is speaking in multi-speaker audio:
+
+```bash
+whispero debate.mp3 --diarize
+# [FALANTE 1] [00:00] Boa noite a todos, vamos começar...
+# [FALANTE 2] [00:12] Obrigado pelo convite, é um prazer...
+# [FALANTE 1] [00:28] Então, o primeiro ponto da pauta...
+```
+
+Two engines:
+
+- **llm** (default): prompt-based diarization using the provider's native
+  audio understanding. Works out of the box, no extra dependencies.
+  On `--provider openai` it falls back to a text-based heuristic
+  (clearly marked), since Whisper doesn't return voice information —
+  use `--provider gemini` for voice-based diarization.
+- **pyannote**: precise timestamped segments via
+  [pyannote.audio](https://github.com/pyannote/pyannote-audio).
+  Needs `pip install "whispero[diarize]"` and `HF_TOKEN` (accept the
+  model terms at
+  https://huggingface.co/pyannote/speaker-diarization-3.1).
+  Each speaker chunk is transcribed separately and reassembled with
+  exact speaker labels and timestamps.
+
+`whispero-analyze --diarize` adds a `diarization` array to the JSON output
+with `speaker`, `start`, `end` and `text` per segment.
 
 ## Features
 
