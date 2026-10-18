@@ -310,6 +310,42 @@ def gemini_diarize(base: str, key: str, model: str, media_part: dict,
 
 # ---------------- OpenAI-compatible provider ----------------
 
+def _mmss_to_s(ts: str) -> int:
+    mm, ss = ts.split(":")[-2:]
+    return int(mm) * 60 + int(float(ss))
+
+
+def shared_diarize(base: str, key: str, model: str, media_part: dict,
+                   lang: str = "pt", rounds: int = 3,
+                   audio_path: str | None = None) -> list | None:
+    """Same diarization path as `whispero --diarize` (transcribe.py).
+
+    Reuses the segment-level consensus vote with the simpler transcribe
+    prompt, which separates same-gender speakers reliably; the old
+    analyze-only prompt collapsed two male voices into one in every run.
+    Returns [{"speaker", "start", "end", "text"}] (end = next start).
+    """
+    try:
+        from transcribe import gemini_diarize_vote_segments, pitch_split
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from transcribe import gemini_diarize_vote_segments, pitch_split
+    segs = gemini_diarize_vote_segments(base, key, model, media_part,
+                                        lang=lang, rounds=rounds)
+    if not segs:
+        return None
+    if audio_path:
+        segs = pitch_split(segs, audio_path)
+    out = []
+    for i, s in enumerate(segs):
+        end = segs[i + 1]["start"] if i + 1 < len(segs) else None
+        if end is not None and _mmss_to_s(end) < _mmss_to_s(s["start"]):
+            end = s["start"]
+        out.append({"speaker": s["speaker"], "start": s["start"],
+                    "end": end or s["start"], "text": s["text"]})
+    return out
+
+
 def openai_transcribe(base: str, key: str, model: str,
                       audio_path: str) -> str | None:
     import uuid
@@ -397,6 +433,9 @@ def main() -> int:
                    help="Identify speakers ([FALANTE 1], [FALANTE 2], ...) "
                         "with timestamps; adds a diarization section to "
                         "the JSON output")
+    p.add_argument("--no-pitch-check", action="store_true",
+                   help="Disable the pitch check that splits two same-gender "
+                        "voices merged into one label (needs numpy)")
     args = p.parse_args()
 
     key = get_api_key(args)
@@ -433,7 +472,11 @@ def main() -> int:
                 if args.diarize:
                     print("diarizing in separate call...",
                           file=sys.stderr)
-                    dz = gemini_diarize(base, key, m, media_part)
+                    dz = shared_diarize(
+                        base, key, m, media_part,
+                        audio_path=None if (is_url(args.source)
+                                            or args.no_pitch_check)
+                        else args.source)
                     if dz:
                         result["diarization"] = dz
                     else:
