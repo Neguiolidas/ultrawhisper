@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whispero"
-version = "0.4.0"
+version = "0.5.0"
 description = "Universal audio transcription and deep analysis - Gemini native audio plus any OpenAI-compatible API"
 readme = "README.md"
 authors = [{name = "Neguiolidas"}]
@@ -33,6 +33,11 @@ dictate = [
     "pystray>=0.19",
     "Pillow>=9.0",
 ]
+voiceid = [
+    "onnxruntime>=1.17",
+    "huggingface_hub>=0.20",
+    "numpy>=1.24",
+]
 
 [project.urls]
 Homepage = "https://github.com/Neguiolidas/whispero"
@@ -43,6 +48,8 @@ Issues = "https://github.com/Neguiolidas/whispero/issues"
 whispero = "transcribe:main"
 whispero-analyze = "audio_analyze:main"
 whispero-dictate = "dictate:main"
+whispero-enroll = "voiceid:main"
+whispero-ears = "ears:main"
 
 [tool.setuptools]
-py-modules = ["transcribe", "audio_analyze", "dictate"]
+py-modules = ["transcribe", "audio_analyze", "dictate", "voiceid", "ears"]

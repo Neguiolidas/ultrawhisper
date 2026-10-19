@@ -142,6 +142,27 @@ whispero-dictate --cleanup-provider openai \
 Note: the Anthropic Messages API has no audio input, so it only applies to
 this text-only cleanup pass, never to transcription itself.
 
+## Ears for agents
+
+Give any agent rich hearing: speaker identity, transcript, tone, emotion,
+urgency. Not just text.
+
+```bash
+pip install "whispero[voiceid]"
+
+# Enroll a voice once (~10s of clean speech)
+whispero-enroll my-voice.wav --name "Neguiolidas"
+
+# Audio -> rich turn JSON (schema whispero-turn/1)
+whispero-ears turn.wav --pretty
+# {"schema": "whispero-turn/1", "speaker": "Neguiolidas",
+#  "speaker_score": 0.93, "transcript": "...", "tone": "animado",
+#  "emotion": "curiosidade", "urgency": "baixa", ...}
+```
+
+Speaker verification runs locally (ONNX embedding, no API call, no upload).
+See `EARS.md` for the turn contract.
+
 ## Features
 
 - Two transcription providers: `gemini` (default, native audio + YouTube URLs)
