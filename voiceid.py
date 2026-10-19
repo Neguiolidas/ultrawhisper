@@ -197,6 +197,17 @@ def verify(audio_path: str, name: str) -> tuple[bool, float]:
     return score >= threshold, round(score, 3)
 
 
+def _adaptive_threshold(duration_s: float, base: float) -> float:
+    """Lower the threshold for short utterances: less audio = noisier
+    embedding = lower expected cosine similarity. Calibrated on 5-voice
+    test: short turns (1-3s) of the right speaker score 0.35-0.49."""
+    if duration_s < 1.5:
+        return base - 0.20
+    if duration_s < 3.0:
+        return base - 0.10
+    return base
+
+
 def identify(audio_path: str) -> tuple[str, float]:
     """Identify the speaker: best enrolled match or "unknown".
 
@@ -208,17 +219,23 @@ def identify(audio_path: str) -> tuple[str, float]:
     wav = load_wav_16k(audio_path)
     if len(wav) < int(1.0 * SR):
         return "unknown", 0.0
+    duration_s = len(wav) / SR
     emb = embed(wav)
-    best, best_score = "unknown", -1.0
+    scored = []
     for name, vp in store.items():
         v = np.array(vp["embedding"], dtype=np.float32)
         v = v / np.linalg.norm(v)
-        score = float(np.dot(emb, v))
-        if score > best_score:
-            best, best_score = name, score
-    threshold = float(store[best].get("threshold", DEFAULT_THRESHOLD)) \
-        if best != "unknown" else DEFAULT_THRESHOLD
+        scored.append((name, float(np.dot(emb, v))))
+    scored.sort(key=lambda x: -x[1])
+    best, best_score = scored[0]
+    second_score = scored[1][1] if len(scored) > 1 else -1.0
+    base_threshold = float(store[best].get("threshold", DEFAULT_THRESHOLD))
+    threshold = _adaptive_threshold(duration_s, base_threshold)
     if best_score < threshold:
+        return "unknown", round(best_score, 3)
+    # margin check: for short audio, top-2 must be clearly separated,
+    # otherwise the match is ambiguous (e.g. two similar voices)
+    if duration_s < 3.0 and best_score - second_score < 0.05:
         return "unknown", round(best_score, 3)
     return best, round(best_score, 3)
 
@@ -230,6 +247,27 @@ def list_voices() -> list[dict]:
             for n, v in store.items()]
 
 
+def delete_voice(name: str) -> bool:
+    """Delete an enrolled voiceprint. Returns True if it existed."""
+    store = _load_store()
+    if name not in store:
+        return False
+    del store[name]
+    _save_store(store)
+    return True
+
+
+def rename_voice(old: str, new: str) -> None:
+    """Rename an enrolled voiceprint. Raises KeyError/ValueError."""
+    store = _load_store()
+    if old not in store:
+        raise KeyError(f'no voiceprint enrolled for "{old}"')
+    if new in store:
+        raise ValueError(f'voiceprint "{new}" already exists')
+    store[new] = store.pop(old)
+    _save_store(store)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Whispero Voice ID enrollment.")
     p.add_argument("audio", nargs="?", help="Audio file with clean speech")
@@ -237,7 +275,31 @@ def main() -> int:
     p.add_argument("--list", action="store_true", help="List enrolled voices")
     p.add_argument("--verify", default=None, metavar="NAME",
                    help="Verify audio against an enrolled voice")
+    p.add_argument("--delete", default=None, metavar="NAME",
+                   help="Delete an enrolled voiceprint")
+    p.add_argument("--rename", default=None, metavar="OLD:NEW",
+                   help="Rename a voiceprint (format OLD:NEW)")
     args = p.parse_args()
+
+    if args.delete:
+        if delete_voice(args.delete):
+            print(json.dumps({"deleted": args.delete}))
+            return 0
+        print(f"error: no voiceprint enrolled for \"{args.delete}\"",
+              file=sys.stderr)
+        return 2
+
+    if args.rename:
+        if ":" not in args.rename:
+            p.error("--rename needs OLD:NEW format")
+        old, new = args.rename.split(":", 1)
+        try:
+            rename_voice(old.strip(), new.strip())
+        except (KeyError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        print(json.dumps({"renamed": {"from": old.strip(), "to": new.strip()}}))
+        return 0
 
     if args.list:
         voices = list_voices()

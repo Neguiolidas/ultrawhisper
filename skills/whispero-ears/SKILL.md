@@ -48,6 +48,12 @@ Output (schema `whispero-turn/1`):
 - Voiceprints are local (`~/.whispero/voiceprints.json`), never uploaded.
 - Speaker ID runs fully offline (ONNX embedding); only the transcript +
   tone pass uses the Whispero API engine.
+- Manage: `--delete NAME`, `--rename OLD:NEW`.
+
+## Conversation history
+
+- `--history conversa.jsonl`: appends each turn, last 5 become context for
+  tone/emotion. Use for multi-turn conversations.
 
 ## Limits
 

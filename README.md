@@ -64,6 +64,8 @@ whispero meeting.mp3 --diarize --diarize-engine pyannote
 
 # Configurable fallback models (comma-separated, tried in order)
 whispero meeting.mp3 --fallback-models gemini-2.0-flash
+# Or via env var (CLI flag takes precedence)
+export WHISPERO_FALLBACK_MODELS="gemini-2.0-flash,gemini-1.5-flash"
 ```
 
 ## Speaker diarization
@@ -172,6 +174,8 @@ See `EARS.md` for the turn contract.
 - Speaker diarization ([FALANTE 1], [FALANTE 2] with voice characteristics)
 - Retry with exponential backoff on rate limits and server errors
 - `--fallback-models`: configurable comma-separated fallback list
+  (or `WHISPERO_FALLBACK_MODELS` env); logs which model responded
+- `--output FILE --format {txt,json,srt}`: save to file; srt needs --diarize
 - `--compress` flag: converts to opus 32k mono 16kHz via ffmpeg before upload
 - JSON validation on analysis output
 - Zero pip dependencies, only stdlib + ffmpeg
@@ -192,6 +196,24 @@ GTA 6 trailer via YouTube URL (no download):
 |---|---|---|
 | transcribe.py | ~12s | dialogue + song lyrics + on-screen text |
 | audio_analyze.py | ~23s | 4 speakers, tone, 9 key moments, intent |
+
+## Free alternative: faster-whisper large-v3-turbo
+
+Tested 2026-10-19: perfect PT-BR transcription (0% WER) + 100% diarization
+accuracy on real 3-speaker audio (41/41 segments), ~0.6x realtime, free
+within the daily quota. No dedicated provider — the API needs an https URL
+for the audio:
+
+```bash
+curl -X POST https://api.free.ai/v1/stt/ \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $FREEAI_KEY" \
+  -d '{"model": "whisper", "audio_url": "https://.../audio.mp3"}'
+# → {"text": "...", "segments": [{"speaker": "Speaker 1", "start": 0.18, ...}], "language": "pt"}
+```
+
+Note: direct file upload needs a separate free.ai account; via URL works
+with the API key alone.
 
 ## License
 

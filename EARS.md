@@ -92,3 +92,21 @@ whispero-ears turn.wav --lang en --provider openai \
     --base-url https://api.groq.com/openai/v1
 whispero-ears turn.wav --no-identify   # skip speaker ID
 ```
+
+## Conversation history
+
+For multi-turn conversations, pass `--history` with a JSONL file. Each turn
+is appended, and the last 5 turns become context for tone/emotion analysis:
+
+```bash
+whispero-ears turn1.wav --history conversa.jsonl --pretty
+whispero-ears turn2.wav --history conversa.jsonl --pretty
+# turn2's analysis sees turn1's transcript and speaker
+```
+
+## Voice management
+
+```bash
+whispero-enroll --delete "Nome"        # remove a voiceprint
+whispero-enroll --rename "Antigo:Novo" # rename a voiceprint
+```

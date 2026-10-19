@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whispero"
-version = "0.5.0"
+version = "0.6.0"
 description = "Universal audio transcription and deep analysis - Gemini native audio plus any OpenAI-compatible API"
 readme = "README.md"
 authors = [{name = "Neguiolidas"}]

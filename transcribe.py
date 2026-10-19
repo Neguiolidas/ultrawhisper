@@ -547,6 +547,56 @@ def _segments_to_text(segments: list[dict]) -> str:
     )
 
 
+def _srt_ts(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def to_srt(segments: list[dict]) -> str:
+    """Segments (with 'start' as MM:SS or seconds, 'text') to SRT."""
+    blocks = []
+    for i, seg in enumerate(segments):
+        start = seg["start"]
+        start_s = _ts_to_s(start) if isinstance(start, str) else float(start)
+        # end = next segment's start, or +5s for the last one
+        if i + 1 < len(segments):
+            nxt = segments[i + 1]["start"]
+            end_s = _ts_to_s(nxt) if isinstance(nxt, str) else float(nxt)
+        else:
+            end_s = start_s + 5.0
+        if end_s <= start_s:
+            end_s = start_s + 2.0
+        speaker = seg.get("speaker", "")
+        prefix = f"[{speaker}] " if speaker else ""
+        blocks.append(
+            f"{i + 1}\n{_srt_ts(start_s)} --> {_srt_ts(end_s)}\n"
+            f"{prefix}{seg['text']}"
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
+def emit(text: str, args, model: str,
+         segments: list[dict] | None = None) -> None:
+    """Output transcript to stdout or --output file, in --format."""
+    if args.format == "json":
+        payload = {"text": text, "model": model, "lang": args.lang,
+                   "source": args.source}
+        out = json.dumps(payload, ensure_ascii=False, indent=2)
+    elif args.format == "srt" and segments:
+        out = to_srt(segments)
+    else:
+        out = text
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(out + "\n")
+        print(f"info: wrote {args.output}", file=sys.stderr)
+    else:
+        print(out)
+
+
 # ---------------- OpenAI-compatible provider ----------------
 
 def openai_transcribe(base: str, key: str, model: str, audio_path: str,
@@ -673,7 +723,8 @@ def main() -> int:
                    help="Custom API base URL for OpenAI-compatible providers")
     p.add_argument("--api-key", default=None, help="API key (or env var)")
     p.add_argument("--fallback-models", default="",
-                   help="Comma-separated fallback models to try in order")
+                   help="Comma-separated fallback models to try in order "
+                        "(or WHISPERO_FALLBACK_MODELS env)")
     p.add_argument("--prompt", default=None)
     p.add_argument("--lang", default="pt")
     p.add_argument("--compress", action="store_true",
@@ -689,10 +740,16 @@ def main() -> int:
                    help="Diarization engine: llm (prompt-based, works out of "
                         "the box) or pyannote (precise, needs pyannote.audio "
                         "+ HF_TOKEN). Default: llm")
+    p.add_argument("--output", default=None, metavar="FILE",
+                   help="Write transcript to FILE instead of stdout")
+    p.add_argument("--format", default="txt", choices=["txt", "json", "srt"],
+                   help="Output format: txt (default), json (with metadata), "
+                        "srt (subtitles, needs --diarize)")
     args = p.parse_args()
 
     key = get_api_key(args)
-    fallbacks = [m.strip() for m in args.fallback_models.split(",") if m.strip()]
+    fb_arg = args.fallback_models or os.environ.get("WHISPERO_FALLBACK_MODELS", "")
+    fallbacks = [m.strip() for m in fb_arg.split(",") if m.strip()]
 
     # pyannote engine: precise speaker segments first, then transcribe per chunk
     pyannote_segments: list[dict] | None = None
@@ -739,6 +796,7 @@ def main() -> int:
                         text = gemini_transcribe(base, key, m, chunk_prompt,
                                                  media_part)
                         if text:
+                            print(f"info: chunk via {m}", file=sys.stderr)
                             break
                     if text:
                         out_lines.append(
@@ -748,7 +806,7 @@ def main() -> int:
                 finally:
                     os.unlink(chunk)
             if out_lines:
-                print("\n".join(out_lines))
+                emit("\n".join(out_lines), args, model)
                 return 0
             print("error: no usable transcript from any chunk",
                   file=sys.stderr)
@@ -785,15 +843,28 @@ def main() -> int:
         for m in models:
             if args.diarize and not args.prompt:
                 # Diarization in separate call with voting (stable speaker count)
-                text = gemini_diarize_vote(
-                    base, key, m, media_part, lang=args.lang,
-                    audio_path=None if (is_url(args.source)
-                                        or args.no_pitch_check)
-                    else args.source)
+                if args.format == "srt":
+                    segs = gemini_diarize_vote_segments(
+                        base, key, m, media_part, lang=args.lang,
+                        audio_path=None if (is_url(args.source)
+                                            or args.no_pitch_check)
+                        else args.source)
+                    if segs:
+                        print(f"info: transcript via {m}", file=sys.stderr)
+                        emit("", args, m, segments=segs)
+                        return 0
+                    text = None
+                else:
+                    text = gemini_diarize_vote(
+                        base, key, m, media_part, lang=args.lang,
+                        audio_path=None if (is_url(args.source)
+                                            or args.no_pitch_check)
+                        else args.source)
             else:
                 text = gemini_transcribe(base, key, m, prompt, media_part)
             if text:
-                print(text)
+                print(f"info: transcript via {m}", file=sys.stderr)
+                emit(text, args, m)
                 return 0
             print(f"warn: empty response from {m}, trying next...",
                   file=sys.stderr)
@@ -821,6 +892,7 @@ def main() -> int:
             for m in models:
                 text = openai_transcribe(base, key, m, src, args.lang)
                 if text:
+                    print(f"info: transcript via {m}", file=sys.stderr)
                     break
                 print(f"warn: empty response from {m}, trying next...",
                       file=sys.stderr)
@@ -844,12 +916,12 @@ def main() -> int:
             marked = openai_chat(base, key, chat_model,
                                  DIARIZE_TEXT_PROMPT + text)
             if marked:
-                print(marked)
+                emit(marked, args, chat_model)
                 return 0
             print("warn: diarization pass failed, printing plain transcript",
                   file=sys.stderr)
 
-        print(text)
+        emit(text, args, model)
         return 0
 
 

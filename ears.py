@@ -78,6 +78,17 @@ def analyze_turn(audio_path: str, cfg: dict) -> dict:
     lang = cfg.get("lang") or "pt"
     provider = cfg.get("provider") or "gemini"
 
+    # conversation history: recent turns as context for tone/emotion
+    history_ctx = ""
+    history_path = cfg.get("history")
+    if history_path:
+        prev = _load_history(history_path)
+        if prev:
+            lines = [f"[{p.get('speaker', '?')}] {p.get('transcript', '')[:120]}"
+                     for p in prev]
+            history_ctx = ("\nContexto da conversa (turnos anteriores):\n"
+                           + "\n".join(lines) + "\n")
+
     class A:
         pass
     a = A()
@@ -112,6 +123,9 @@ def analyze_turn(audio_path: str, cfg: dict) -> dict:
             print(f"warn: speaker id failed ({e})", file=sys.stderr)
 
     # 2. transcript + tone + emotion + urgency (one API pass)
+    base_prompt = TURN_PROMPT.format(lang=lang)
+    if history_ctx:
+        base_prompt = history_ctx + "\n" + base_prompt
     if provider == "gemini":
         model = cfg.get("model") or t.DEFAULT_GEMINI_MODEL
         mime, _ = mimetypes.guess_type(audio_path)
@@ -120,8 +134,7 @@ def analyze_turn(audio_path: str, cfg: dict) -> dict:
         media_part = {"inline_data": {"mime_type": mime or "audio/wav",
                                       "data": b64}}
         text = t.gemini_transcribe(
-            t.GEMINI_API_BASE, key, model,
-            TURN_PROMPT.format(lang=lang), media_part)
+            t.GEMINI_API_BASE, key, model, base_prompt, media_part)
     else:
         # OpenAI-compatible: transcribe, then text-analyze the transcript
         model = cfg.get("model") or t.DEFAULT_OPENAI_MODEL
@@ -177,7 +190,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip speaker identification")
     p.add_argument("--pretty", action="store_true",
                    help="Pretty-print the JSON")
+    p.add_argument("--history", default=None, metavar="FILE",
+                   help="JSONL conversation history: appends this turn and "
+                        "uses recent turns as context")
     return p
+
+
+def _load_history(path: str, limit: int = 5) -> list[dict]:
+    """Load recent turns from a JSONL history file."""
+    turns = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        turns.append(json.loads(line))
+                    except ValueError:
+                        continue
+    except FileNotFoundError:
+        pass
+    return turns[-limit:]
+
+
+def _append_history(path: str, turn: dict) -> None:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(turn, ensure_ascii=False) + "\n")
 
 
 def main() -> int:
@@ -189,6 +227,7 @@ def main() -> int:
         "base_url": args.base_url,
         "api_key": args.api_key,
         "identify": not args.no_identify,
+        "history": args.history,
     }
     try:
         turn = analyze_turn(args.audio, cfg)
@@ -197,6 +236,8 @@ def main() -> int:
         return 2
     except SystemExit as e:
         return int(e.code or 1)
+    if args.history:
+        _append_history(args.history, turn)
     print(json.dumps(turn, ensure_ascii=False,
                      indent=2 if args.pretty else None))
     return 0
