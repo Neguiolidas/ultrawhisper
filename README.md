@@ -95,10 +95,59 @@ Two engines:
 `whispero-analyze --diarize` adds a `diarization` array to the JSON output
 with `speaker`, `start`, `end` and `text` per segment.
 
+## Hands-free dictation
+
+Hold a hotkey, speak, release: the text lands in whatever app has focus
+(Claude Code, terminal, browser, ...). SuperWhisper-style, powered by the
+Whispero engine instead of a local model.
+
+```bash
+pip install "whispero[dictate]"
+
+# Hold F8 (default), speak, release -> text is pasted at the cursor
+whispero-dictate
+
+# Toggle mode: press once to start, press again to stop and paste
+whispero-dictate --mode toggle --hotkey "<ctrl>+<alt>+space"
+
+# Test the paste pipeline without recording
+whispero-dictate --test-inject "hello from whispero"
+```
+
+Config lives in `~/.whispero/dictate.json` (hotkey, mode, lang, cleanup,
+post-record hook). Esc cancels a recording. See `DICTATE.md` for the full
+guide.
+
+### Cleanup LLM providers
+
+After transcription, an LLM pass removes filler words and fixes punctuation.
+It defaults to your transcription provider, but you can point it at any of
+the three:
+
+```bash
+# Claude (Anthropic API) for the cleanup pass
+export ANTHROPIC_API_KEY=<redacted>
+whispero-dictate --cleanup-provider anthropic
+
+# Any Anthropic-compatible endpoint (proxy, gateway, LiteLLM...)
+whispero-dictate --cleanup-provider anthropic \
+    --cleanup-base-url https://my-proxy.example/v1 \
+    --cleanup-model my-claude-model
+
+# Or keep it on OpenAI-compatible
+whispero-dictate --cleanup-provider openai \
+    --cleanup-base-url https://api.groq.com/openai/v1
+```
+
+Note: the Anthropic Messages API has no audio input, so it only applies to
+this text-only cleanup pass, never to transcription itself.
+
 ## Features
 
-- Two providers: `gemini` (default, native audio + YouTube URLs) and `openai`
-  (any OpenAI-compatible `/v1/audio/transcriptions` endpoint)
+- Two transcription providers: `gemini` (default, native audio + YouTube URLs)
+  and `openai` (any OpenAI-compatible `/v1/audio/transcriptions` endpoint)
+- Third provider for the text layer: `anthropic` (Messages API) powers the
+  LLM cleanup pass in `whispero-dictate` (`--cleanup-provider anthropic`)
 - Speaker diarization ([FALANTE 1], [FALANTE 2] with voice characteristics)
 - Retry with exponential backoff on rate limits and server errors
 - `--fallback-models`: configurable comma-separated fallback list

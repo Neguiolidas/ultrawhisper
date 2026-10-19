@@ -32,8 +32,11 @@ import urllib.error
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_OPENAI_MODEL = "whisper-1"
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 OPENAI_API_BASE = "https://api.openai.com/v1"
+ANTHROPIC_API_BASE = "https://api.anthropic.com/v1"
+ANTHROPIC_VERSION = "2023-06-01"
 MAX_RETRIES = 3
 ROUND_DELAY = 2  # seconds between diarization rounds
 RETRY_DELAYS = [2, 5, 10]
@@ -72,14 +75,28 @@ def is_url(s: str) -> bool:
 
 
 def get_api_key(args) -> str:
-    for src in (args.api_key, os.environ.get("WHISPERO_API_KEY"),
-                os.environ.get("GEMINI_API_KEY"),
-                os.environ.get("OPENAI_API_KEY")):
+    # Precedence: explicit --api-key > provider-specific env >
+    # WHISPERO_API_KEY > any other known env var.
+    provider = getattr(args, "provider", None)
+    specific = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+    }.get(provider)
+    order = ([specific] if specific else []) + [
+        "WHISPERO_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ]
+    seen: set[str] = set()
+    order = [e for e in order if not (e in seen or seen.add(e))]
+    cands = [getattr(args, "api_key", None)]
+    cands += [os.environ.get(e) for e in order]
+    for src in cands:
         if src and src.strip():
             return src.strip()
     print(
         "error: no API key. Use --api-key or set WHISPERO_API_KEY "
-        "(or GEMINI_API_KEY / OPENAI_API_KEY).",
+        "(or GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY).",
         file=sys.stderr,
     )
     sys.exit(3)
@@ -606,6 +623,41 @@ def openai_chat(base: str, key: str, model: str, prompt: str) -> str | None:
         return data["choices"][0]["message"]["content"].strip() or None
     except (KeyError, IndexError, TypeError):
         return None
+
+
+def anthropic_chat(base: str, key: str, model: str, prompt: str,
+                   system: str | None = None,
+                   max_tokens: int = 1024) -> str | None:
+    """Text chat via the Anthropic Messages API (or compatible endpoint).
+
+    Note: the Messages API has no audio input, so this is text-only.
+    Used for the LLM passes (cleanup, text analysis), not transcription.
+    """
+    url = f"{base.rstrip('/')}/messages"
+    payload: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    if system:
+        payload["system"] = system
+    data = http_post(
+        url,
+        {"Content-Type": "application/json",
+         "x-api-key": key,
+         "anthropic-version": ANTHROPIC_VERSION},
+        json.dumps(payload).encode(),
+    )
+    if not data:
+        return None
+    try:
+        for block in data["content"]:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                return block["text"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError):
+        pass
+    return None
 
 
 # ---------------- main ----------------
