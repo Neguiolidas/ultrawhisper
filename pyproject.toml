@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whispero"
-version = "0.6.0"
-description = "Universal audio transcription and deep analysis - Gemini native audio plus any OpenAI-compatible API"
+version = "0.7.0"
+description = "Universal audio transcription and deep analysis - fully offline local mode, Gemini native audio, plus any OpenAI-compatible API"
 readme = "README.md"
 authors = [{name = "Neguiolidas"}]
 license = {text = "Apache-2.0"}
@@ -25,6 +25,13 @@ dependencies = []
 
 [project.optional-dependencies]
 diarize = ["pyannote.audio>=3.0"]
+local = [
+    "faster-whisper>=1.1",
+    "onnxruntime>=1.17",
+    "huggingface_hub>=0.20",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
 dictate = [
     "sounddevice>=0.4",
     "numpy>=1.24",
@@ -38,6 +45,12 @@ voiceid = [
     "huggingface_hub>=0.20",
     "numpy>=1.24",
 ]
+hear = [
+    "librosa>=0.10",
+    "scipy>=1.10",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+]
 
 [project.urls]
 Homepage = "https://github.com/Neguiolidas/whispero"
@@ -50,6 +63,8 @@ whispero-analyze = "audio_analyze:main"
 whispero-dictate = "dictate:main"
 whispero-enroll = "voiceid:main"
 whispero-ears = "ears:main"
+whispero-hear = "hear:main"
 
 [tool.setuptools]
-py-modules = ["transcribe", "audio_analyze", "dictate", "voiceid", "ears"]
+py-modules = ["transcribe", "audio_analyze", "dictate", "voiceid", "ears",
+              "hear", "local_engine"]

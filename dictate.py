@@ -2,7 +2,7 @@
 """Whispero Dictate - hands-free voice dictation for any app.
 
 Hold the hotkey (default F8), speak, release: the transcription is typed
-into whatever app has focus (Claude Code, terminal, browser, ...).
+into whatever app has focus (code editor, terminal, browser, ...).
 
 Usage:
     whispero-dictate [--hotkey f8] [--mode push|toggle] [--lang pt]

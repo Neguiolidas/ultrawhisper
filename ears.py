@@ -133,8 +133,15 @@ def analyze_turn(audio_path: str, cfg: dict) -> dict:
             b64 = base64.b64encode(fh.read()).decode("ascii")
         media_part = {"inline_data": {"mime_type": mime or "audio/wav",
                                       "data": b64}}
-        text = t.gemini_transcribe(
-            t.GEMINI_API_BASE, key, model, base_prompt, media_part)
+        text = None
+        fallbacks = [m for m in (cfg.get("fallback_models") or "").split(",")
+                     if m.strip()]
+        for m in [model] + [x.strip() for x in fallbacks]:
+            text = t.gemini_transcribe(
+                t.GEMINI_API_BASE, key, m, base_prompt, media_part)
+            if text:
+                turn["model"] = m
+                break
     else:
         # OpenAI-compatible: transcribe, then text-analyze the transcript
         model = cfg.get("model") or t.DEFAULT_OPENAI_MODEL
@@ -169,6 +176,9 @@ def analyze_turn(audio_path: str, cfg: dict) -> dict:
             if text.strip():
                 turn["transcript"] = text.strip()
 
+    if not text:
+        # API failed: say so instead of returning a blank "neutro" turn
+        turn["error"] = "no response from the model (see stderr)"
     return turn
 
 
@@ -184,6 +194,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lang", default="pt")
     p.add_argument("--provider", default="gemini", choices=["gemini", "openai"])
     p.add_argument("--model", default=None)
+    p.add_argument("--fallback-models", default=os.environ.get(
+        "WHISPERO_FALLBACK_MODELS", ""),
+        help="Comma-separated models to try if --model fails")
     p.add_argument("--base-url", default=None)
     p.add_argument("--api-key", default=None)
     p.add_argument("--no-identify", action="store_true",
@@ -193,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--history", default=None, metavar="FILE",
                    help="JSONL conversation history: appends this turn and "
                         "uses recent turns as context")
+    p.add_argument("--hear", action="store_true",
+                   help="Attach measured signal analysis (whispero-hear/1) "
+                        "as turn['hearing'] (needs whispero[hear])")
+    p.add_argument("--hear-baseline", default=None, metavar="FILE",
+                   help="Reference speaker audio for hear deviation flags")
     return p
 
 
@@ -218,6 +236,30 @@ def _append_history(path: str, turn: dict) -> None:
         fh.write(json.dumps(turn, ensure_ascii=False) + "\n")
 
 
+def _import_hear():
+    try:
+        import hear as h
+        return h
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import hear as h
+        return h
+
+
+def attach_hearing(turn: dict, audio: str,
+                   baseline: str | None = None) -> dict:
+    """Attach measured signal analysis to a turn, additively only.
+
+    Adds turn["hearing"] (schema whispero-hear/1) and never modifies
+    any existing turn key, so the whispero-turn/1 contract is
+    preserved. Raises SystemExit(4) when the hear extra (librosa) is
+    not installed, same convention as the voiceid extra.
+    """
+    hear = _import_hear()
+    turn["hearing"] = hear.analyze(audio, baseline_path=baseline)
+    return turn
+
+
 def main() -> int:
     args = build_parser().parse_args()
     cfg = {
@@ -226,6 +268,7 @@ def main() -> int:
         "model": args.model,
         "base_url": args.base_url,
         "api_key": args.api_key,
+        "fallback_models": args.fallback_models,
         "identify": not args.no_identify,
         "history": args.history,
     }
@@ -236,11 +279,19 @@ def main() -> int:
         return 2
     except SystemExit as e:
         return int(e.code or 1)
-    if args.history:
-        _append_history(args.history, turn)
+    if args.hear:
+        try:
+            attach_hearing(turn, args.audio, args.hear_baseline)
+        except SystemExit as e:
+            return int(e.code or 1)
+        except FileNotFoundError as e:
+            print(f"error: file not found: {e}", file=sys.stderr)
+            return 2
+    if args.history and "error" not in turn:
+        _append_history(args.history, turn)  # never feed blank turns back
     print(json.dumps(turn, ensure_ascii=False,
                      indent=2 if args.pretty else None))
-    return 0
+    return 5 if "error" in turn else 0
 
 
 if __name__ == "__main__":

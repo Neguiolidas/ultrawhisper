@@ -30,7 +30,7 @@ import urllib.request
 import urllib.error
 
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"  # 2.5-* answer 404 for new keys
 DEFAULT_OPENAI_MODEL = "whisper-1"
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -96,7 +96,8 @@ def get_api_key(args) -> str:
             return src.strip()
     print(
         "error: no API key. Use --api-key or set WHISPERO_API_KEY "
-        "(or GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY).",
+        "(or GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY), "
+        "or run offline with --provider local.",
         file=sys.stderr,
     )
     sys.exit(3)
@@ -132,6 +133,15 @@ def http_post(url: str, headers: dict, data: bytes | None = None,
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503):
                 last_err = e
+                if e.code == 429:
+                    body = e.read().decode(errors="replace")
+                    if "PerDay" in body or _retry_delay_s(body) > 60:
+                        # daily/long quota: retrying burns time, the next
+                        # model in --fallback-models is the only way out
+                        print(f"warn: quota exhausted (429, retry in "
+                              f"{_retry_delay_s(body):.0f}s); skipping retries",
+                              file=sys.stderr)
+                        return None
             else:
                 body = e.read().decode(errors="replace")[:300]
                 print(f"error: API {e.code}: {body}", file=sys.stderr)
@@ -142,6 +152,13 @@ def http_post(url: str, headers: dict, data: bytes | None = None,
             time.sleep(RETRY_DELAYS[attempt])
     print(f"warn: failed after {MAX_RETRIES} tries: {last_err}", file=sys.stderr)
     return None
+
+
+def _retry_delay_s(body: str) -> float:
+    """Gemini RetryInfo.retryDelay ("44024s") from an error body, else 0."""
+    import re
+    m = re.search(r'"retryDelay":\s*"([0-9.]+)s"', body)
+    return float(m.group(1)) if m else 0.0
 
 
 # ---------------- Diarization ----------------
@@ -339,15 +356,25 @@ def gemini_diarize_vote(base: str, key: str, model: str, media_part: dict,
                        audio_path: str | None = None) -> str | None:
     """Text wrapper around gemini_diarize_vote_segments (kept for the CLI)."""
     segs = gemini_diarize_vote_segments(base, key, model, media_part,
-                                        lang=lang, rounds=rounds)
-    if segs and audio_path:
-        segs = pitch_split(segs, audio_path)
+                                        lang=lang, rounds=rounds,
+                                        audio_path=audio_path)
     return _segments_to_text(segs) if segs else None
 
 
 def gemini_diarize_vote_segments(base: str, key: str, model: str,
                                  media_part: dict, lang: str = "pt",
-                                 rounds: int = 3) -> list[dict] | None:
+                                 rounds: int = 3,
+                                 audio_path: str | None = None
+                                 ) -> list[dict] | None:
+    """Consensus segments; pitch check applied when audio_path is given."""
+    segs = _vote_segments(base, key, model, media_part, lang, rounds)
+    if segs and audio_path:
+        segs = pitch_split(segs, audio_path)
+    return segs
+
+
+def _vote_segments(base: str, key: str, model: str, media_part: dict,
+                   lang: str = "pt", rounds: int = 3) -> list[dict] | None:
     """Diarization with segment-level majority vote across N runs.
 
     Runs the diarization prompt N times, aligns speaker labels across runs
@@ -376,6 +403,9 @@ def gemini_diarize_vote_segments(base: str, key: str, model: str,
     if len(all_runs) == 1:
         return all_runs[0]
 
+    # Reference = the most granular run: one run that merged turns
+    # (seen: 14 segments vs 28) must not set the segmentation.
+    all_runs.sort(key=len, reverse=True)
     ref = all_runs[0]
     # Build label maps from each run to reference
     label_maps = [_build_label_map(ref, run) for run in all_runs]
@@ -562,7 +592,9 @@ def to_srt(segments: list[dict]) -> str:
         start = seg["start"]
         start_s = _ts_to_s(start) if isinstance(start, str) else float(start)
         # end = next segment's start, or +5s for the last one
-        if i + 1 < len(segments):
+        if seg.get("end") is not None:
+            end_s = float(seg["end"])
+        elif i + 1 < len(segments):
             nxt = segments[i + 1]["start"]
             end_s = _ts_to_s(nxt) if isinstance(nxt, str) else float(nxt)
         else:
@@ -584,6 +616,17 @@ def emit(text: str, args, model: str,
     if args.format == "json":
         payload = {"text": text, "model": model, "lang": args.lang,
                    "source": args.source}
+        if segments is None and text and getattr(args, "diarize", False):
+            segments = parse_diarize_lines(text) or None
+        if segments:
+            def _s(v):
+                return _ts_to_s(v) if isinstance(v, str) else v
+            payload["segments"] = [
+                {"speaker": sg["speaker"], "start": _s(sg["start"]),
+                 "end": (_s(sg["end"]) if sg.get("end") is not None
+                         else _s(segments[i + 1]["start"])
+                         if i + 1 < len(segments) else None),
+                 "text": sg["text"]} for i, sg in enumerate(segments)]
         out = json.dumps(payload, ensure_ascii=False, indent=2)
     elif args.format == "srt" and segments:
         out = to_srt(segments)
@@ -713,12 +756,26 @@ def anthropic_chat(base: str, key: str, model: str, prompt: str,
 # ---------------- main ----------------
 
 def main() -> int:
+    # `whispero hear ...` dispatches to the hear module (lazy import:
+    # plain `whispero` keeps working without the hear extra).
+    if len(sys.argv) > 1 and sys.argv[1] == "hear":
+        try:
+            import hear as _hear
+        except ImportError:
+            print("error: whispero hear needs: pip install \"whispero[hear]\"",
+                  file=sys.stderr)
+            return 4
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        return _hear.main()
     p = argparse.ArgumentParser(description="Whispero transcription.")
     p.add_argument("source", help="Audio file path or YouTube URL (gemini only)")
     p.add_argument("--provider", default=DEFAULT_PROVIDER,
-                   choices=["gemini", "openai"])
+                   choices=["gemini", "openai", "local"],
+                   help="local = faster-whisper on this machine, no API key "
+                        '(pip install "whispero[local]")')
     p.add_argument("--model", default=None,
-                   help="Model name (default: gemini-2.5-flash / whisper-1)")
+                   help="Model name (default: gemini-3.5-flash / whisper-1 / "
+                        "large-v3-turbo for --provider local)")
     p.add_argument("--base-url", default=None,
                    help="Custom API base URL for OpenAI-compatible providers")
     p.add_argument("--api-key", default=None, help="API key (or env var)")
@@ -735,17 +792,33 @@ def main() -> int:
     p.add_argument("--no-pitch-check", action="store_true",
                    help="Disable the pitch check that splits two same-gender "
                         "voices merged into one label (needs numpy)")
-    p.add_argument("--diarize-engine", default="llm",
-                   choices=["llm", "pyannote"],
+    p.add_argument("--diarize-engine", default=None,
+                   choices=["llm", "pyannote", "local"],
                    help="Diarization engine: llm (prompt-based, works out of "
-                        "the box) or pyannote (precise, needs pyannote.audio "
-                        "+ HF_TOKEN). Default: llm")
+                        "the box), pyannote (needs pyannote.audio + HF_TOKEN) "
+                        "or local (voice embeddings on this machine, no key; "
+                        "needs --provider local). Default: local with "
+                        "--provider local, else llm")
+    p.add_argument("--num-speakers", type=int, default=None,
+                   help="Local engine: fixed number of speakers "
+                        "(default: estimated automatically)")
+    p.add_argument("--threads", type=int, default=None,
+                   help="Local provider: CPU threads (default: physical "
+                        "cores, max 8)")
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="Local provider: batched inference size, 0 = off "
+                        "(default 8)")
     p.add_argument("--output", default=None, metavar="FILE",
                    help="Write transcript to FILE instead of stdout")
     p.add_argument("--format", default="txt", choices=["txt", "json", "srt"],
                    help="Output format: txt (default), json (with metadata), "
                         "srt (subtitles, needs --diarize)")
     args = p.parse_args()
+    if args.diarize_engine is None:
+        args.diarize_engine = "local" if args.provider == "local" else "llm"
+
+    if args.provider == "local" or args.diarize_engine == "local":
+        return _main_local(args)
 
     key = get_api_key(args)
     fb_arg = args.fallback_models or os.environ.get("WHISPERO_FALLBACK_MODELS", "")
@@ -923,6 +996,32 @@ def main() -> int:
 
         emit(text, args, model)
         return 0
+
+
+def _main_local(args) -> int:
+    """--provider local: everything runs on this machine (local_engine.py)."""
+    if args.provider != "local":
+        print("error: --diarize-engine local needs --provider local",
+              file=sys.stderr)
+        return 2
+    if is_url(args.source) or not os.path.isfile(args.source):
+        print(f"error: --provider local needs a local file: {args.source}",
+              file=sys.stderr)
+        return 2
+    import local_engine
+    model = args.model or local_engine.DEFAULT_LOCAL_MODEL
+    text, turns = local_engine.run(
+        args.source, lang=args.lang, model=model,
+        diarize_speakers=args.diarize, num_speakers=args.num_speakers,
+        threads=args.threads, batch_size=args.batch_size)
+    if not text:
+        print("error: empty transcript (no speech found?)", file=sys.stderr)
+        return 5
+    if turns:
+        text = "\n".join(f"[{t['speaker']}] [{fmt_ts(t['start'])}] {t['text']}"
+                         for t in turns)
+    emit(text, args, f"local/{model}", segments=turns)
+    return 0
 
 
 if __name__ == "__main__":

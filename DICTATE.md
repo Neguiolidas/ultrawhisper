@@ -1,8 +1,8 @@
 # Whispero Dictate
 
 Hands-free voice dictation for any app: hold a hotkey, speak, release, and
-the transcribed text is pasted wherever your cursor is. Works with Claude
-Code, terminals, browsers, editors, chat apps — anything that accepts paste.
+the transcribed text is pasted wherever your cursor is. Works with code
+editors, terminals, browsers, chat apps — anything that accepts paste.
 
 ## Per-OS notes
 
@@ -65,7 +65,7 @@ whispero-dictate
 
 A tray icon appears (gray = idle). Now:
 
-1. Click inside Claude Code (or any text field)
+1. Click inside any text field
 2. **Hold F8**, speak, **release**
 3. The text is pasted at the cursor after ~1-3s
 
@@ -179,7 +179,7 @@ Or run `whispero-dictate` manually when you need it.
 ## Test checklist
 
 - [ ] `--test-inject "ola"` pastes into Notepad
-- [ ] Hold F8 in Claude Code, speak a sentence, release → text appears
+- [ ] Hold F8 in any app, speak a sentence, release → text appears
 - [ ] Esc during recording cancels (nothing pasted)
 - [ ] Very short tap (< 0.4s) pastes nothing
 - [ ] Toggle mode works with a custom hotkey

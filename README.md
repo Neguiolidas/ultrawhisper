@@ -3,7 +3,8 @@
 Audio transcription and deep audio analysis with any OpenAI-compatible
 provider. Defaults to Gemini's native audio input (transcribes *and*
 reasons in one pass); also works with OpenAI, Groq, Together, or any
-Whisper-style `/v1/audio/transcriptions` endpoint.
+Whisper-style `/v1/audio/transcriptions` endpoint. A fully offline mode
+(`--provider local`) runs everything on your machine with no API key.
 
 Unlike pure ASR models, the Gemini path processes audio with reasoning: it
 transcribes, cleans up, structures output, detects speakers, emotions, and
@@ -24,6 +25,8 @@ export GEMINI_API_KEY="your-key-here"
 # ...or any provider key, picked up automatically
 export WHISPERO_API_KEY="your-key-here"
 export OPENAI_API_KEY="your-key-here"
+
+# ...or fully offline, no key at all (see Offline mode below)
 ```
 
 ## Usage
@@ -57,6 +60,9 @@ whispero long.mp3 --compress
 # Speaker diarization: who said what, with timestamps
 whispero meeting.mp3 --diarize
 whispero-analyze meeting.mp3 --diarize
+
+# Fully offline: no API key, no upload (pip install "whispero[local]")
+whispero meeting.mp3 --provider local --diarize
 
 # Precise diarization engine (needs pyannote.audio + HF_TOKEN)
 pip install "whispero[diarize]"
@@ -93,14 +99,56 @@ Two engines:
   https://huggingface.co/pyannote/speaker-diarization-3.1).
   Each speaker chunk is transcribed separately and reassembled with
   exact speaker labels and timestamps.
+- **local** (default with `--provider local`): voice embeddings computed
+  on your machine, no API and no Hugging Face token. See
+  [Offline mode](#offline-mode---provider-local).
 
 `whispero-analyze --diarize` adds a `diarization` array to the JSON output
 with `speaker`, `start`, `end` and `text` per segment.
 
+## Offline mode (`--provider local`)
+
+Runs everything on your machine: no API key, no upload, no daily quota.
+
+```bash
+pip install "whispero[local]"
+whispero meeting.mp3 --provider local                    # transcript
+whispero meeting.mp3 --provider local --diarize          # + speakers
+whispero meeting.mp3 --provider local --diarize --format srt --output meeting.srt
+whispero meeting.mp3 --provider local --diarize --num-speakers 4   # known count
+whispero meeting.mp3 --provider local --model large-v3   # most accurate
+```
+
+- **Transcription:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+  on CPU (int8, batched). Default model `large-v3-turbo` (about 2x faster);
+  `--model large-v3` is a little more accurate. Models download once
+  (1.6 GB / 3 GB) to `~/.cache/huggingface`.
+- **Diarization:** Silero VAD → 1 s voice windows → WeSpeaker ResNet34-LM
+  embeddings (ONNX, the same public model `whispero-enroll` uses) →
+  spectral clustering that estimates the number of speakers → one speaker
+  per sentence. Overlapping speech gets a single speaker.
+- **CPU:** `--threads` defaults to the number of physical cores (max 8).
+  More threads than physical cores was 2-10x *slower* in our tests.
+  `--batch-size 0` turns batching off.
+
+Measured on an 8-core / 16-thread Xeon with no GPU, on synthetic PT-BR
+conversations with exact answer keys (lines with the correct speaker):
+
+| | 3 voices (134 s) | 5 voices, noisy bar + video call (172 s) | time, 3 voices |
+|---|---|---|---|
+| local, large-v3-turbo | 26/28, WER 3.6% | 39/43 | 24 s |
+| local, large-v3 | 27/28, WER 2.3% | 41/43 | 42 s |
+| gemini-3.5-flash `--diarize` | 27/28, WER 4.3% | 34/43 (6 speakers) | 70 s |
+
+The remaining misses are short interjections said over someone else
+("Sério?", "Aham."). In heavy noise (5 dB SNR) the speaker count can come
+out too low. Pass `--num-speakers` if you know it (5-voice test at 5 dB:
+28/43 automatic, 40/43 with `--num-speakers 5`).
+
 ## Hands-free dictation
 
 Hold a hotkey, speak, release: the text lands in whatever app has focus
-(Claude Code, terminal, browser, ...). SuperWhisper-style, powered by the
+(code editor, terminal, browser, ...). SuperWhisper-style, powered by the
 Whispero engine instead of a local model.
 
 ```bash
@@ -167,8 +215,9 @@ See `EARS.md` for the turn contract.
 
 ## Features
 
-- Two transcription providers: `gemini` (default, native audio + YouTube URLs)
-  and `openai` (any OpenAI-compatible `/v1/audio/transcriptions` endpoint)
+- Three transcription providers: `gemini` (default, native audio + YouTube URLs),
+  `openai` (any OpenAI-compatible `/v1/audio/transcriptions` endpoint) and
+  `local` (fully offline, faster-whisper on CPU, no API key)
 - Third provider for the text layer: `anthropic` (Messages API) powers the
   LLM cleanup pass in `whispero-dictate` (`--cleanup-provider anthropic`)
 - Speaker diarization ([FALANTE 1], [FALANTE 2] with voice characteristics)
@@ -178,7 +227,8 @@ See `EARS.md` for the turn contract.
 - `--output FILE --format {txt,json,srt}`: save to file; srt needs --diarize
 - `--compress` flag: converts to opus 32k mono 16kHz via ffmpeg before upload
 - JSON validation on analysis output
-- Zero pip dependencies, only stdlib + ffmpeg
+- Base has zero pip dependencies (stdlib + ffmpeg); each extra installs
+  only what its feature needs
 
 ## Benchmark
 
@@ -197,23 +247,20 @@ GTA 6 trailer via YouTube URL (no download):
 | transcribe.py | ~12s | dialogue + song lyrics + on-screen text |
 | audio_analyze.py | ~23s | 4 speakers, tone, 9 key moments, intent |
 
-## Free alternative: faster-whisper large-v3-turbo
-
-Tested 2026-10-19: perfect PT-BR transcription (0% WER) + 100% diarization
-accuracy on real 3-speaker audio (41/41 segments), ~0.6x realtime, free
-within the daily quota. No dedicated provider — the API needs an https URL
-for the audio:
+## Hear: measured signal analysis (v0.7.0)
 
 ```bash
-curl -X POST https://api.free.ai/v1/stt/ \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $FREEAI_KEY" \
-  -d '{"model": "whisper", "audio_url": "https://.../audio.mp3"}'
-# → {"text": "...", "segments": [{"speaker": "Speaker 1", "start": 0.18, ...}], "language": "pt"}
+pip install "whispero[hear]"
+whispero hear voice.wav --baseline original.wav
+whispero-ears voice.wav --hear --hear-baseline original.wav
 ```
 
-Note: direct file upload needs a separate free.ai account; via URL works
-with the API key alone.
+Hear measures the waveform instead of guessing from words: prosody (F0,
+range, rate, pauses), fricative spectra, timbre, music ducking, cut
+placement and prosodic state, all reported as deviations from a
+reference speaker baseline (warn at 30%, fail at 50%, provisional
+until calibrated on real voice). No hard emotion labels, no faked
+numbers: optional torch models report as unavailable when absent.
 
 ## License
 
